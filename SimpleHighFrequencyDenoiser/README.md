@@ -18,11 +18,19 @@ No neural networks, no wavelets, no black box: just a luminance mask, a Gaussian
 
 The blend is applied to the target as a single PixelMath step, so the whole operation can be undone with **Ctrl/Cmd+Z**.
 
+### Data range and precision
+
+- Supported input range is PixInsight's normalized **[0, 1]**. Images with samples outside it are rejected with a message rather than silently clipped.
+- Inside that range the blend is a convex combination of two [0, 1] images, so it is applied **without truncation**. Only the mask is clamped to [0, 1].
+- Temporary images are floating point: 64-bit for 64-bit sources, 32-bit otherwise.
+- **Amount = 0** leaves the image untouched (the script returns before doing anything).
+- Temporary windows are always closed if something fails; on success, *Keep mask* / *Keep blurred* decide.
+
 ## Requirements
 
 - **PixInsight 1.9 or later** (V8 JavaScript runtime)
 - Linux, macOS or Windows
-- Works with RGB and monochrome images, linear or stretched
+- Works with RGB and monochrome images, linear or stretched, with samples in [0, 1]
 
 ## Installation
 
@@ -73,7 +81,7 @@ Tip: enable **Keep mask window** on the first run to see which areas are protect
 - **Auto target** is the main knob for *where* the denoise is applied: 0.1–0.15 smooths the background aggressively, 0.25–0.35 protects more of the faint signal.
 - Stars stay sharp because they are bright in the mask. If faint stars get softened, lower *Mask midtones* (or raise *Auto target*) to brighten the mask.
 - Running the script twice with a small sigma usually looks more natural than once with a large one.
-- If PixInsight's `Convolution` process is unavailable in your build, the script automatically falls back to PixelMath's `gconv()` and prints a warning to the console.
+- If the `Convolution` process throws or reports failure, the script falls back to PixelMath's `gconv()` and prints the reason to the console. To test that path deliberately, set `FORCE_GCONV_FALLBACK = true` at the top of the script.
 
 ## Limitations
 

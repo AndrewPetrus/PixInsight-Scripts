@@ -29,7 +29,10 @@ var PARAMS = {
    fluxPower:       1.0,
 
    // Blending
-   intensity:       0.03,
+   // intensity = per-pixel peak of the brightest star's spike (0–1).
+   // Settings v1 used an overlapping rasterizer that summed ≈ 2·ceil(3σ)+1
+   // samples per pixel; 0.33 here matches the old default 0.03 at σ = 1.5.
+   intensity:       0.33,
    colorAmount:     0.25,
 
    // Chromatic model: gradient envelope + oscillating waves
@@ -50,14 +53,148 @@ var PARAMS = {
    secondaryEnabled:   true,
    secondaryAngle:     45,
    secondaryLength:    0.42,
-   secondaryIntensity: 0.22,
+   secondaryIntensity: 0.14,   // ≈ old 0.22 after per-width gain correction
    secondaryWidth:     0.75,
 
    // Star detection
    maxStars:         0,     // 0 = no limit
    minFluxFraction:  0.01,  // ignore stars below this fraction of the brightest star's flux
-   sdSensitivity:    0.5    // StarDetector sensitivity (0–1, higher = more stars detected)
+   sdSensitivity:    0.5,   // StarDetector sensitivity (0–1, higher = more stars detected)
+
+   settingsVersion:  2      // 1 = overlapping rasterizer (pre-2026-11), 2 = exact
 };
+
+var DEFAULT_PARAMS = JSON.parse(JSON.stringify(PARAMS));
+
+var ERROR_ICON = (typeof StdIcon !== "undefined" && typeof StdIcon.Error !== "undefined")
+               ? StdIcon.Error
+               : ((typeof StdIcon_Error !== "undefined") ? StdIcon_Error : 4);
+
+// Secondary spikes dimmer than this per-pixel peak are not drawn.
+var SECONDARY_MIN_PEAK = 0.05;
+
+function errText(e) {
+   if (e === undefined || e === null) return "unknown error";
+   if (typeof e === "string") return e;
+   if (e.message) return String(e.message);
+   return String(e);
+}
+
+// ─── Parameter validation ─────────────────────────────────────────────────────
+// [key, label, min, max, integer]
+var PARAM_RULES = [
+   ["numRays",            "Number of rays",        2,     16,    true ],
+   ["angleOffset",        "Angle offset",          -360,  360,   false],
+   ["maxLength",          "Max length",            1,     5000,  false],
+   ["minLength",          "Min length",            0,     5000,  false],
+   ["spikeWidth",         "Spike width σ",         0.1,   50,    false],
+   ["widthTaper",         "Width taper",           0,     1,     false],
+   ["falloffExp",         "Falloff exponent",      0.1,   20,    false],
+   ["fluxPower",          "Flux power",            0,     10,    false],
+   ["intensity",          "Intensity",             0,     1,     false],
+   ["colorAmount",        "Star colour tint",      0,     1,     false],
+   ["chromaticAmount",    "Chromatic amount",      0,     1,     false],
+   ["chromaticWaveAmt",   "Wave modulation",       0,     1,     false],
+   ["chromaticWaves",     "Wave cycles",           1,     10,    true ],
+   ["glowRadius",         "Core glow radius",      0,     500,   false],
+   ["glowIntensity",      "Core glow intensity",   0,     1,     false],
+   ["outerGlowRadius",    "Outer glow radius",     0,     500,   false],
+   ["outerGlowIntensity", "Outer glow intensity",  0,     1,     false],
+   ["secondaryAngle",     "Secondary angle offset",-360,  360,   false],
+   ["secondaryLength",    "Length fraction",       0,     1,     false],
+   ["secondaryIntensity", "Intensity fraction",    0,     1,     false],
+   ["secondaryWidth",     "Secondary width σ",     0.1,   50,    false],
+   ["maxStars",           "Max stars",             0,     100000, true],
+   ["minFluxFraction",    "Min flux fraction",     0,     1,     false],
+   ["sdSensitivity",      "SD sensitivity",        0,     1,     false]
+];
+
+// Returns null when p is valid, otherwise a message naming the offending field.
+function validateParams(p) {
+   for (var i = 0; i < PARAM_RULES.length; i++) {
+      var r = PARAM_RULES[i], v = p[r[0]];
+      if (typeof v !== "number" || !Number.isFinite(v))
+         return r[1] + ": must be a finite number.";
+      if (v < r[2] || v > r[3])
+         return r[1] + ": must be between " + r[2] + " and " + r[3] + " (got " + v + ").";
+      if (r[4] && Math.floor(v) !== v)
+         return r[1] + ": must be an integer.";
+   }
+   if (p.minLength > p.maxLength)
+      return "Min length (" + p.minLength + ") must not exceed Max length (" + p.maxLength + ").";
+   if (!Array.isArray(p.chromScale) || p.chromScale.length !== 3)
+      return "Scale R/G/B: three values are required.";
+   var names = ["Scale R", "Scale G", "Scale B"];
+   for (var c = 0; c < 3; c++) {
+      var v = p.chromScale[c];
+      if (typeof v !== "number" || !Number.isFinite(v) || v <= 0 || v > 2)
+         return names[c] + ": must be in (0, 2] (got " + v + ").";
+   }
+   if (typeof p.secondaryEnabled !== "boolean")
+      return "Enable secondary spikes: invalid value.";
+   return null;
+}
+
+// Peak gain of the v1 rasterizer for a horizontal ray of base width σ.
+function legacyGain(sigma) { return 2 * Math.ceil(3 * sigma) + 1; }
+
+// ─── Settings persistence ─────────────────────────────────────────────────────
+// Stores entire PARAMS as a single JSON string via PixInsight's Settings API.
+// One string key means no DataType_Int32/Double/Boolean constants needed —
+// only DataType_String (or its V8 equivalent, discovered at runtime).
+
+var SETTINGS_KEY = "DiffractionSpikes/params";
+
+// Resolve the string DataType constant across SM and V8 naming schemes.
+var _DT_STRING = (function() {
+   if (typeof DataType_String  !== "undefined") return DataType_String;
+   if (typeof DataType         !== "undefined" &&
+       typeof DataType.String  !== "undefined") return DataType.String;
+   return 0; // numeric fallback (value in all known PJSR versions)
+})();
+
+function saveSettings() {
+   try {
+      Settings.write(SETTINGS_KEY, _DT_STRING, JSON.stringify(PARAMS));
+   } catch(e) {
+      console.warningln("DiffractionSpikes: could not save settings: " + e.message);
+   }
+}
+
+function loadSettings() {
+   try {
+      var json = Settings.read(SETTINGS_KEY, _DT_STRING);
+      if (!json) return;
+      var saved = JSON.parse(json);
+      var candidate = JSON.parse(JSON.stringify(DEFAULT_PARAMS));
+      // Only restore keys that already exist in PARAMS (safe when new params are added)
+      for (var key in candidate) {
+         if (key !== "settingsVersion" && saved.hasOwnProperty(key) &&
+             saved[key] !== null && saved[key] !== undefined)
+            candidate[key] = saved[key];
+      }
+      // v1 intensities were inflated by the overlapping rasterizer: convert
+      // them so that saved settings keep their look.
+      if (!saved.settingsVersion || saved.settingsVersion < 2) {
+         var g  = legacyGain(candidate.spikeWidth);
+         var gs = legacyGain(candidate.secondaryWidth);
+         candidate.intensity          = Math.min(1, candidate.intensity * g);
+         candidate.secondaryIntensity = Math.min(1, candidate.secondaryIntensity * gs / g);
+         console.writeln("DiffractionSpikes: migrated saved settings to v2 " +
+                         "(intensity ×" + g + ").");
+      }
+      var problem = validateParams(candidate);
+      if (problem) {
+         console.warningln("DiffractionSpikes: saved settings are invalid (" + problem +
+                           "), using defaults.");
+         return;
+      }
+      for (var key in candidate)
+         PARAMS[key] = candidate[key];
+   } catch(e) {
+      console.writeln("DiffractionSpikes: no saved settings, using defaults (" + e.message + ").");
+   }
+}
 
 // ─── Dialog ───────────────────────────────────────────────────────────────────
 
@@ -210,39 +347,54 @@ var DiffractionDialog = class extends Dialog {
       this.okBtn = new PushButton(this);
       this.okBtn.text = "Apply";
       this.okBtn.onClick = function() {
-         function pf(edit, def) { var v = parseFloat(edit.text); return isNaN(v) ? def : v; }
+         // Strict number parsing: "12abc", "" or "Infinity" become invalid
+         // values and are reported by validateParams() instead of being
+         // silently replaced or accepted.
+         function pf(edit) {
+            var text = String(edit.text).trim();
+            return text.length > 0 ? Number(text) : NaN;
+         }
+         var P = JSON.parse(JSON.stringify(PARAMS));
 
-         PARAMS.numRays           = wNumRays.spin.value;
-         PARAMS.angleOffset       = pf(wAngle.edit,   PARAMS.angleOffset);
-         PARAMS.maxLength         = pf(wMaxLen.edit,  PARAMS.maxLength);
-         PARAMS.minLength         = pf(wMinLen.edit,  PARAMS.minLength);
-         PARAMS.spikeWidth        = pf(wWidth.edit,   PARAMS.spikeWidth);
-         PARAMS.widthTaper        = pf(wTaper.edit,   PARAMS.widthTaper);
-         PARAMS.falloffExp        = pf(wFalloff.edit, PARAMS.falloffExp);
-         PARAMS.fluxPower         = pf(wFluxPow.edit, PARAMS.fluxPower);
-         PARAMS.intensity         = wIntensity.slider.value / 100;
-         PARAMS.colorAmount       = wColorAmt.slider.value  / 100;
-         PARAMS.chromaticAmount   = wChromAmt.slider.value  / 100;
-         PARAMS.chromaticWaveAmt  = wWaveAmt.slider.value   / 100;
-         PARAMS.chromaticWaves    = wWaves.spin.value;
-         PARAMS.chromScale        = [
-            pf(wChromR.edit, PARAMS.chromScale[0]),
-            pf(wChromG.edit, PARAMS.chromScale[1]),
-            pf(wChromB.edit, PARAMS.chromScale[2])
+         P.numRays           = wNumRays.spin.value;
+         P.angleOffset       = pf(wAngle.edit);
+         P.maxLength         = pf(wMaxLen.edit);
+         P.minLength         = pf(wMinLen.edit);
+         P.spikeWidth        = pf(wWidth.edit);
+         P.widthTaper        = pf(wTaper.edit);
+         P.falloffExp        = pf(wFalloff.edit);
+         P.fluxPower         = pf(wFluxPow.edit);
+         P.intensity         = wIntensity.slider.value / 100;
+         P.colorAmount       = wColorAmt.slider.value  / 100;
+         P.chromaticAmount   = wChromAmt.slider.value  / 100;
+         P.chromaticWaveAmt  = wWaveAmt.slider.value   / 100;
+         P.chromaticWaves    = wWaves.spin.value;
+         P.chromScale        = [
+            pf(wChromR.edit),
+            pf(wChromG.edit),
+            pf(wChromB.edit)
          ];
-         PARAMS.glowRadius        = pf(wGlowR.edit,  PARAMS.glowRadius);
-         PARAMS.glowIntensity     = wGlowI.slider.value  / 100;
-         PARAMS.outerGlowRadius   = pf(wOuterR.edit, PARAMS.outerGlowRadius);
-         PARAMS.outerGlowIntensity = wOuterI.slider.value / 100;
-         PARAMS.secondaryEnabled  = wSecOn.check.checked;
-         PARAMS.secondaryAngle    = pf(wSecAng.edit, PARAMS.secondaryAngle);
-         PARAMS.secondaryLength   = pf(wSecLen.edit, PARAMS.secondaryLength);
-         PARAMS.secondaryIntensity = pf(wSecInt.edit, PARAMS.secondaryIntensity);
-         PARAMS.secondaryWidth    = pf(wSecW.edit,   PARAMS.secondaryWidth);
-         PARAMS.maxStars          = wMaxStars.spin.value;
-         PARAMS.minFluxFraction   = pf(wMinFlux.edit,  PARAMS.minFluxFraction);
-         PARAMS.sdSensitivity     = pf(wSdSens.edit,   PARAMS.sdSensitivity);
+         P.glowRadius        = pf(wGlowR.edit);
+         P.glowIntensity     = wGlowI.slider.value  / 100;
+         P.outerGlowRadius   = pf(wOuterR.edit);
+         P.outerGlowIntensity = wOuterI.slider.value / 100;
+         P.secondaryEnabled  = wSecOn.check.checked;
+         P.secondaryAngle    = pf(wSecAng.edit);
+         P.secondaryLength   = pf(wSecLen.edit);
+         P.secondaryIntensity = pf(wSecInt.edit);
+         P.secondaryWidth    = pf(wSecW.edit);
+         P.maxStars          = wMaxStars.spin.value;
+         P.minFluxFraction   = pf(wMinFlux.edit);
+         P.sdSensitivity     = pf(wSdSens.edit);
 
+         var problem = validateParams(P);
+         if (problem) {
+            new MessageBox(problem, "Diffraction Spikes", ERROR_ICON).execute();
+            return;   // keep the dialog open
+         }
+         for (var key in P)
+            PARAMS[key] = P[key];
+         saveSettings();
          self.ok();
       };
 
@@ -344,55 +496,66 @@ function sampleStarColor(image, x, y) {
  * In a refractor, blue light focuses shorter → blue spike decays faster.
  * Each channel gets a different effective length → warm (reddish) tips.
  * chromScale = [R, G, B] relative length factors.
+ *
+ * Rasterization: every pixel inside the ray's bounding box is visited exactly
+ * once. Its position is projected onto the ray to get the longitudinal (t) and
+ * perpendicular (perp) coordinates, and the spike profile is evaluated a
+ * single time. The energy of a ray therefore does not depend on its angle or
+ * on the kernel size, and peakIntensity is the peak of the profile itself.
+ * (The brightest *pixel* of a very thin ray still varies a little with angle:
+ * that is ordinary sampling of a ~1–2 px wide line, not accumulation.)
  */
 function drawRay(spikeImg, W, H, cx, cy, dx, dy, length, peakIntensity, starColor, width) {
    var baseW  = (width !== undefined) ? width : PARAMS.spikeWidth;
    var taper  = Math.max(0.05, Math.min(1.0, PARAMS.widthTaper));
-   var kR     = Math.ceil(baseW * 3); // kernel based on max (base) width
+   var reach  = 3 * baseW;               // max perpendicular extent (3σ at the base)
    var nc     = spikeImg.numberOfChannels;
    var cAmt   = PARAMS.chromaticAmount;
    var colAmt = PARAMS.colorAmount;
    var cs     = PARAMS.chromScale;
+   var wAmt   = PARAMS.chromaticWaveAmt;
+   var nW     = PARAMS.chromaticWaves;
+   var fExp   = PARAMS.falloffExp;
+   var TAU    = 2 * Math.PI;
+   var wPhase = [0, TAU / 3, 2 * TAU / 3];
 
-   for (var t = 1; t <= length; t++) {
-      var px = cx + t * dx;
-      var py = cy + t * dy;
-      // Width tapers linearly: wide at base (near star), narrow at tip
-      var sigma = baseW * (taper + (1 - taper) * (1 - t / length));
+   if (!(length > 0) || !(peakIntensity > 0)) return;
 
-      // Per-channel intensity = gradient envelope × sinusoidal wave
-      // Envelope: R longest, B shortest (refractor aberration)
-      // Wave: 120° phase offset between R/G/B → color rings along spike
-      var chanI = [];
-      var anyVisible = false;
-      var wAmt  = PARAMS.chromaticWaveAmt;
-      var nW    = PARAMS.chromaticWaves;
-      var TAU   = 2 * Math.PI;
-      var wPhase = [0, TAU / 3, 2 * TAU / 3];
-      for (var c = 0; c < nc; c++) {
-         var scale   = (nc >= 3 && c < cs.length) ? (1 - cAmt + cAmt * cs[c]) : 1.0;
-         var effLen  = length * scale;
-         var falloff = Math.exp(-Math.pow(t / effLen, PARAMS.falloffExp) * 5);
-         var wave    = 0.5 + 0.5 * Math.sin(nW * TAU * t / length + (wPhase[c] || 0));
-         chanI[c]    = peakIntensity * falloff * ((1 - wAmt) + wAmt * wave);
-         if (chanI[c] > 1e-6) anyVisible = true;
-      }
-      if (!anyVisible) break;
+   // Per-channel constants: effective length (R longest, B shortest) and tint.
+   var effLen = [], tint = [];
+   for (var c = 0; c < nc; c++) {
+      var scale = (nc >= 3 && c < cs.length) ? (1 - cAmt + cAmt * cs[c]) : 1.0;
+      effLen[c] = length * scale;
+      tint[c]   = (1 - colAmt) + colAmt * starColor[c];
+   }
 
-      for (var kx = -kR; kx <= kR; kx++) {
-         for (var ky = -kR; ky <= kR; ky++) {
-            var perp  = kx * (-dy) + ky * dx;
-            var gauss = Math.exp(-(perp * perp) / (2 * sigma * sigma));
-            var ix    = Math.round(px + kx);
-            var iy    = Math.round(py + ky);
-            if (ix < 0 || ix >= W || iy < 0 || iy >= H) continue;
+   // Bounding box of the segment [star, star + length·d], widened by the reach.
+   var ex = cx + length * dx, ey = cy + length * dy;
+   var x0 = Math.max(0,     Math.floor(Math.min(cx, ex) - reach));
+   var x1 = Math.min(W - 1, Math.ceil (Math.max(cx, ex) + reach));
+   var y0 = Math.max(0,     Math.floor(Math.min(cy, ey) - reach));
+   var y1 = Math.min(H - 1, Math.ceil (Math.max(cy, ey) + reach));
+   var nx = -dy, ny = dx;                // unit normal to the ray
 
-            for (var c = 0; c < nc; c++) {
-               if (chanI[c] < 1e-6) continue;
-               var colTint = (1 - colAmt) + colAmt * starColor[c];
-               var add     = chanI[c] * gauss * colTint;
-               spikeImg.setSample(Math.min(1.0, spikeImg.sample(ix, iy, c) + add), ix, iy, c);
-            }
+   for (var iy = y0; iy <= y1; iy++) {
+      for (var ix = x0; ix <= x1; ix++) {
+         var rx = ix - cx, ry = iy - cy;
+         var t  = rx * dx + ry * dy;     // along the ray
+         if (t < 0 || t > length) continue;
+         var perp = rx * nx + ry * ny;   // across the ray
+         // Width tapers linearly: wide at base (near star), narrow at tip
+         var sigma = baseW * (taper + (1 - taper) * (1 - t / length));
+         if (Math.abs(perp) > 3 * sigma) continue;
+         var gauss = Math.exp(-(perp * perp) / (2 * sigma * sigma));
+
+         for (var c = 0; c < nc; c++) {
+            // Per-channel intensity = gradient envelope × sinusoidal wave
+            // Wave: 120° phase offset between R/G/B → color rings along spike
+            var falloff = Math.exp(-Math.pow(t / effLen[c], fExp) * 5);
+            var wave    = 0.5 + 0.5 * Math.sin(nW * TAU * t / length + (wPhase[c] || 0));
+            var add     = peakIntensity * falloff * ((1 - wAmt) + wAmt * wave) * gauss * tint[c];
+            if (add < 1e-7) continue;
+            spikeImg.setSample(Math.min(1.0, spikeImg.sample(ix, iy, c) + add), ix, iy, c);
          }
       }
    }
@@ -444,7 +607,7 @@ function addStarSpikes(spikeImg, W, H, star, normFlux, image) {
    if (PARAMS.secondaryEnabled) {
       var secLen   = length * PARAMS.secondaryLength;
       var secPeak  = peakIntensity * PARAMS.secondaryIntensity;
-      if (secLen > 4 && secPeak > 0.005) {
+      if (secLen > 4 && secPeak > SECONDARY_MIN_PEAK) {
          for (var n = 0; n < PARAMS.numRays; n++) {
             var angle = (PARAMS.angleOffset + PARAMS.secondaryAngle +
                          n * (360.0 / PARAMS.numRays)) * Math.PI / 180.0;
@@ -527,6 +690,8 @@ function main() {
       return;
    }
 
+   loadSettings();
+
    var dlg = new DiffractionDialog();
    if (dlg.execute() !== 1) return;
    // All PARAMS already updated by the Apply button handler
@@ -548,18 +713,27 @@ function main() {
    console.writeln("  Generating spikes…");
    // PixelSampleType.Real = 32-bit float (V8 constant, replaces old SampleType_Real)
    var spikeImg = new Image(W, H, image.numberOfChannels, image.colorSpace, 32, 1 /*PixelSampleType.Real*/);
-   spikeImg.fill(0);
+   try {
+      spikeImg.fill(0);
 
-   for (var s = 0; s < stars.length; s++)
-      addStarSpikes(spikeImg, W, H, stars[s], stars[s].flux, image);
+      for (var s = 0; s < stars.length; s++)
+         addStarSpikes(spikeImg, W, H, stars[s], stars[s].flux, image);
 
-   console.writeln("  Blending…");
-   view.beginProcess();
-   screenBlend(image, spikeImg, W, H);
-   view.endProcess();
-
-   spikeImg.free();
+      console.writeln("  Blending…");
+      view.beginProcess();
+      try {
+         screenBlend(image, spikeImg, W, H);
+      } finally {
+         view.endProcess();
+      }
+   } finally {
+      spikeImg.free();
+   }
    console.writeln("DiffractionSpikes: done.");
 }
 
-main();
+try {
+   main();
+} catch (e) {
+   console.criticalln("DiffractionSpikes: " + errText(e));
+}

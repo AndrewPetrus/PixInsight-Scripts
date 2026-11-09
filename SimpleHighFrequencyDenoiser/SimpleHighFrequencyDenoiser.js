@@ -17,6 +17,12 @@
  *
  * Run with Script > Execute Script File. The result is applied to the selected
  * main view as a single PixelMath step, so it can be undone with Ctrl/Cmd+Z.
+ *
+ * Supported input range: PixInsight's normalized range [0, 1]. Images with
+ * samples outside it are rejected instead of being silently clipped. Inside
+ * that range the final blend is a convex combination of the original and the
+ * blurred copy, so it is applied without any truncation; only the mask is
+ * clamped to [0, 1].
  */
 
 var TITLE = "Simple High Frequency Denoiser";
@@ -31,12 +37,15 @@ var PARAMS = {
    keepBlurred:  false
 };
 
+// Set to true to exercise the PixelMath gconv() fallback instead of Convolution.
+var FORCE_GCONV_FALLBACK = false;
+
 var NO_SWAP = (typeof UndoFlag !== "undefined" && typeof UndoFlag.NoSwapFile !== "undefined")
             ? UndoFlag.NoSwapFile
             : ((typeof UndoFlag_NoSwapFile !== "undefined") ? UndoFlag_NoSwapFile : 0);
 var ERROR_ICON = (typeof StdIcon !== "undefined" && typeof StdIcon.Error !== "undefined")
                ? StdIcon.Error
-               : ((typeof StdIcon_Error !== "undefined") ? StdIcon_Error : 3);
+               : ((typeof StdIcon_Error !== "undefined") ? StdIcon_Error : 4);
 
 // Right + vertically centered label alignment (scoped enum in V8, global in old PJSR).
 var ALIGN_RIGHT_VC = (typeof TextAlign !== "undefined" && typeof TextAlign.Right !== "undefined")
@@ -63,21 +72,35 @@ function uniqueId(base) {
    return id;
 }
 
+// Temporary windows are floating point: 64-bit for 64-bit sources, 32-bit
+// otherwise (exact for every integer format and for 32-bit float).
 function newWindowLike(srcImage, channels, isColor, id) {
+   var bits = (srcImage.isReal && srcImage.bitsPerSample === 64) ? 64 : 32;
    return new ImageWindow(srcImage.width, srcImage.height, channels,
-                          32, true, isColor, uniqueId(id));
+                          bits, true, isColor, uniqueId(id));
 }
 
-function runPixelMath(view, expr) {
+function closeWindow(win) {
+   try {
+      if (win && !win.isNull)
+         win.forceClose();
+   } catch (e) {
+      console.warningln("  could not close temporary window: " + errText(e));
+   }
+}
+
+// truncate = true clamps the result to [0, 1] (used for the mask only).
+function runPixelMath(view, expr, truncate) {
    var P = new PixelMath;
    P.expression = expr;
    P.useSingleExpression = true;
    P.rescale = false;
-   P.truncate = true;
+   P.truncate = (truncate === true);
    P.truncateLower = 0;
    P.truncateUpper = 1;
    P.createNewImage = false;
-   P.executeOn(view);
+   if (!P.executeOn(view))
+      throw new Error("PixelMath failed on " + view.id + ": " + expr);
 }
 
 function errText(e) {
@@ -97,28 +120,42 @@ function convolutionParametricMode() {
 
 function gaussianBlur(view, sigma) {
    if (sigma <= 0) return;
-   try {
-      var C = new Convolution;
-      C.mode = convolutionParametricMode();
-      C.sigma = sigma;
-      C.shape = 2;          // 2 = Gaussian
-      C.aspectRatio = 1;
-      C.rotationAngle = 0;
-      C.executeOn(view, false);
-   } catch (e) {
-      // Fallback: PixelMath Gaussian convolution.
-      console.warningln("  Convolution failed (" + errText(e) +
-                        "), falling back to PixelMath gconv()");
-      runPixelMath(view, "gconv($T, " + sigma.toFixed(4) + ")");
+   var reason = null;
+   if (FORCE_GCONV_FALLBACK) {
+      reason = "forced by FORCE_GCONV_FALLBACK";
+   } else {
+      try {
+         var C = new Convolution;
+         C.mode = convolutionParametricMode();
+         C.sigma = sigma;
+         C.shape = 2;          // 2 = Gaussian
+         C.aspectRatio = 1;
+         C.rotationAngle = 0;
+         if (C.executeOn(view, false))
+            return;
+         reason = "executeOn() returned false";
+      } catch (e) {
+         reason = errText(e);
+      }
    }
+   // Fallback: PixelMath Gaussian convolution. Values stay inside the input
+   // range (positive normalized kernel), so no truncation is needed.
+   console.warningln("  Convolution unavailable (" + reason +
+                     "), falling back to PixelMath gconv()");
+   runPixelMath(view, "gconv($T, " + sigma.toFixed(4) + ")", false);
 }
 
 // Raw luminance (no stretch) into a new grayscale window.
 function makeLuminanceWindow(srcView) {
    var img = srcView.image;
    var win = newWindowLike(img, 1, false, "SHFD_mask");
-   var expr = img.isColor ? "CIEY(" + srcView.id + ")" : srcView.id;
-   runPixelMath(win.mainView, expr);
+   try {
+      var expr = img.isColor ? "CIEY(" + srcView.id + ")" : srcView.id;
+      runPixelMath(win.mainView, expr, true);
+   } catch (e) {
+      closeWindow(win);
+      throw e;
+   }
    return win;
 }
 
@@ -126,13 +163,26 @@ function makeLuminanceWindow(srcView) {
 // For mtf: if mtf(m, x) = t then m = mtf(t, x).
 function autoMidtones(srcView) {
    var win = makeLuminanceWindow(srcView);
-   var med = win.mainView.image.median();
-   win.forceClose();
-   if (med <= 0) return 0.5;
+   var med;
+   try {
+      med = win.mainView.image.median();
+   } finally {
+      closeWindow(win);
+   }
+   if (!(med > 0)) return 0.5;
    return clamp(mtf(PARAMS.autoTarget, med), 0.0001, 0.9999);
 }
 
 // ─── Core ─────────────────────────────────────────────────────────────────────
+
+// Throws when the image has samples outside [0, 1] (see header comment).
+function checkInputRange(image) {
+   var lo = image.minimum(), hi = image.maximum();
+   if (!(lo >= 0 && hi <= 1))
+      throw new Error("The image contains samples outside [0, 1] (min " + lo +
+                      ", max " + hi + "). Rescale or truncate it first; " +
+                      "this script does not clip your data.");
+}
 
 function denoise(target) {
    var t0 = Date.now();
@@ -140,36 +190,53 @@ function denoise(target) {
    console.show();
    console.writeln("<b>" + TITLE + "</b>: " + target.id +
                    " (" + src.width + "x" + src.height + ", " +
-                   (src.isColor ? "RGB" : "mono") + ")");
+                   (src.isColor ? "RGB" : "mono") + ", " + src.bitsPerSample +
+                   (src.isReal ? "-bit float" : "-bit integer") + ")");
 
-   // 1. Luminance mask
-   var maskWin = makeLuminanceWindow(target);
-   var maskView = maskWin.mainView;
-   if (Math.abs(PARAMS.maskMidtones - 0.5) > 1e-6)
-      runPixelMath(maskView, "mtf(" + PARAMS.maskMidtones.toFixed(6) + ", $T)");
-   gaussianBlur(maskView, PARAMS.maskBlur);
-   // amount < 1: push the mask towards 1 (more of the original survives)
-   if (PARAMS.amount < 1)
-      runPixelMath(maskView, "1 - " + PARAMS.amount.toFixed(4) + "*(1 - $T)");
-   console.writeln("  mask: midtones=" + PARAMS.maskMidtones.toFixed(4) +
-                   ", smooth sigma=" + PARAMS.maskBlur +
-                   ", median=" + maskView.image.median().toFixed(4));
+   if (PARAMS.amount <= 0) {
+      console.writeln("  Amount = 0: nothing to do, the image is unchanged.");
+      return;
+   }
+   checkInputRange(src);
 
-   // 2. Blurred copy
-   var blurWin = newWindowLike(src, src.numberOfChannels, src.isColor, "SHFD_blurred");
-   var blurView = blurWin.mainView;
-   blurView.beginProcess(NO_SWAP);
-   blurView.image.assign(src);
-   blurView.endProcess();
-   gaussianBlur(blurView, PARAMS.blurSigma);
-   console.writeln("  blur: sigma=" + PARAMS.blurSigma);
+   var maskWin = null, blurWin = null, succeeded = false;
+   try {
+      // 1. Luminance mask (clamped to [0, 1] at every step)
+      maskWin = makeLuminanceWindow(target);
+      var maskView = maskWin.mainView;
+      if (Math.abs(PARAMS.maskMidtones - 0.5) > 1e-6)
+         runPixelMath(maskView, "mtf(" + PARAMS.maskMidtones.toFixed(6) + ", $T)", true);
+      gaussianBlur(maskView, PARAMS.maskBlur);
+      // amount < 1: push the mask towards 1 (more of the original survives)
+      if (PARAMS.amount < 1)
+         runPixelMath(maskView, "1 - " + PARAMS.amount.toFixed(4) + "*(1 - $T)", true);
+      console.writeln("  mask: midtones=" + PARAMS.maskMidtones.toFixed(4) +
+                      ", smooth sigma=" + PARAMS.maskBlur +
+                      ", median=" + maskView.image.median().toFixed(4));
 
-   // 3. Blend: mask -> 1 keeps original, mask -> 0 takes blurred
-   var m = maskView.id, b = blurView.id;
-   runPixelMath(target, m + "*$T + (1 - " + m + ")*" + b);
+      // 2. Blurred copy
+      blurWin = newWindowLike(src, src.numberOfChannels, src.isColor, "SHFD_blurred");
+      var blurView = blurWin.mainView;
+      blurView.beginProcess(NO_SWAP);
+      try {
+         blurView.image.assign(src);
+      } finally {
+         blurView.endProcess();
+      }
+      gaussianBlur(blurView, PARAMS.blurSigma);
+      console.writeln("  blur: sigma=" + PARAMS.blurSigma);
 
-   if (PARAMS.keepMask)    maskWin.show();    else maskWin.forceClose();
-   if (PARAMS.keepBlurred) blurWin.show();    else blurWin.forceClose();
+      // 3. Blend: mask -> 1 keeps original, mask -> 0 takes blurred.
+      // Convex combination of two [0, 1] images: no truncation applied.
+      var m = maskView.id, b = blurView.id;
+      runPixelMath(target, m + "*$T + (1 - " + m + ")*" + b, false);
+      succeeded = true;
+   } finally {
+      // On failure every temporary window is closed; on success the
+      // Keep mask / Keep blurred options decide.
+      if (succeeded && PARAMS.keepMask)    maskWin.show(); else closeWindow(maskWin);
+      if (succeeded && PARAMS.keepBlurred) blurWin.show(); else closeWindow(blurWin);
+   }
 
    console.writeln("  done in " + ((Date.now() - t0) / 1000).toFixed(2) + " s");
 }
@@ -229,8 +296,12 @@ var DenoiseDialog = class extends Dialog {
          var v = self.viewList.currentView;
          if (v.isNull) return;
          PARAMS.autoTarget = clamp(pf(wTarget.edit, PARAMS.autoTarget), 0.01, 0.99);
-         var m = autoMidtones(v);
-         wMid.edit.text = m.toFixed(4);
+         try {
+            checkInputRange(v.image);
+            wMid.edit.text = autoMidtones(v).toFixed(4);
+         } catch (e) {
+            new MessageBox(errText(e), TITLE, ERROR_ICON).execute();
+         }
       };
       var wMaskBlur = editRow("Mask smoothing σ (px):", PARAMS.maskBlur, 2,
                               "Gaussian blur of the mask to avoid hard transitions. 0 = off.");
