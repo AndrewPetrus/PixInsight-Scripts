@@ -19,4 +19,4 @@ Requirements: PixInsight 1.9 or later (V8 JavaScript runtime).
 
 MIT License — free to use, modify and distribute.
 
-Written by Andrii Petrus.
+By Andreas Petrus.
