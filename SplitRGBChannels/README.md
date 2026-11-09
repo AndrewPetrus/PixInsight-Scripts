@@ -97,4 +97,4 @@ MIT License — free to use, modify and distribute.
 
 ## Author
 
-Written by Andrii Petrus. Built on PixInsight's JavaScript Runtime (PJSR).
+By Andreas Petrus. Built on PixInsight's JavaScript Runtime (PJSR).
